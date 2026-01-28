@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import os
+import sys
+from typing import Iterable, Optional
+
+import pandas as pd
+
+
+LOG = logging.getLogger(__name__)
+
+
+def _read_dataset(path: str) -> pd.DataFrame:
+    _, ext = os.path.splitext(path.lower())
+    if ext in {".parquet"}:
+        return pd.read_parquet(path)
+    if ext in {".json"}:
+        return pd.read_json(path, lines=True)
+    if ext in {".csv", ".gz", ".zip"}:
+        return pd.read_csv(path, dtype=str, low_memory=False)
+    return pd.read_csv(path, dtype=str, low_memory=False)
+
+
+def _guess_cnpj_column(df: pd.DataFrame, explicit: Optional[str]) -> str:
+    if explicit:
+        if explicit not in df.columns:
+            raise ValueError(f"Coluna informada não existe: {explicit}")
+        return explicit
+    for col in df.columns:
+        if "cnpj" in col.lower():
+            return col
+    raise ValueError("Não foi possível inferir a coluna de CNPJ.")
+
+
+def _normalize_cnpj(series: pd.Series) -> pd.Series:
+    cleaned = series.astype(str).str.replace(r"\D", "", regex=True)
+    return cleaned.str.zfill(14)
+
+
+def _load_regime(path: str, regime: str, cnpj_col: Optional[str]) -> pd.DataFrame:
+    df = _read_dataset(path)
+    col = _guess_cnpj_column(df, cnpj_col)
+    regime_df = df[[col]].copy()
+    regime_df[col] = _normalize_cnpj(regime_df[col])
+    regime_df = regime_df.rename(columns={col: "cnpj"})
+    regime_df["regime_tributario"] = regime
+    return regime_df.dropna(subset=["cnpj"])
+
+
+def _merge_regimes(regimes: Iterable[pd.DataFrame]) -> pd.DataFrame:
+    combined = pd.concat(list(regimes), ignore_index=True)
+    duplicated = combined[combined.duplicated(subset=["cnpj"], keep=False)]
+    if not duplicated.empty:
+        LOG.warning(
+            "Encontrados %s CNPJs em múltiplos regimes; mantendo o primeiro.",
+            duplicated["cnpj"].nunique(),
+        )
+    return combined.drop_duplicates(subset=["cnpj"], keep="first")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extrai o regime tributário das empresas combinando bases de "
+            "Imunes e Isentas, Lucro Arbitrado, Lucro Presumido e Lucro Real "
+            "com a base principal de CNPJ."
+        )
+    )
+    parser.add_argument("--imunes-isentas", required=True, help="Arquivo da base Imunes e Isentas.")
+    parser.add_argument("--lucro-arbitrado", required=True, help="Arquivo da base Lucro Arbitrado.")
+    parser.add_argument("--lucro-presumido", required=True, help="Arquivo da base Lucro Presumido.")
+    parser.add_argument("--lucro-real", required=True, help="Arquivo da base Lucro Real.")
+    parser.add_argument("--cnpj-base", required=True, help="Arquivo da base principal de CNPJ.")
+    parser.add_argument("--output", required=True, help="Arquivo CSV de saída.")
+    parser.add_argument(
+        "--regime-cnpj-column",
+        help="Nome da coluna de CNPJ nas bases de regime (se todas forem iguais).",
+    )
+    parser.add_argument(
+        "--cnpj-base-column",
+        help="Nome da coluna de CNPJ na base principal.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Nível de log.",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level))
+
+    regimes = _merge_regimes(
+        [
+            _load_regime(args.imunes_isentas, "Imunes e Isentas", args.regime_cnpj_column),
+            _load_regime(args.lucro_arbitrado, "Lucro Arbitrado", args.regime_cnpj_column),
+            _load_regime(args.lucro_presumido, "Lucro Presumido", args.regime_cnpj_column),
+            _load_regime(args.lucro_real, "Lucro Real", args.regime_cnpj_column),
+        ]
+    )
+
+    base_cnpj = _read_dataset(args.cnpj_base)
+    base_cnpj_col = _guess_cnpj_column(base_cnpj, args.cnpj_base_column)
+    base_cnpj = base_cnpj.copy()
+    base_cnpj[base_cnpj_col] = _normalize_cnpj(base_cnpj[base_cnpj_col])
+    base_cnpj = base_cnpj.rename(columns={base_cnpj_col: "cnpj"})
+
+    resultado = base_cnpj.merge(regimes, how="left", on="cnpj")
+    resultado.to_csv(args.output, index=False)
+
+    LOG.info("Arquivo gerado em %s com %s registros.", args.output, len(resultado))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
